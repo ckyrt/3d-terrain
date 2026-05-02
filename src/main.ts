@@ -165,8 +165,8 @@ const terrainShaderMaterial = new ShaderMaterial({
   uniforms: {
     sunDirection: { value: new Vector3(-0.52, 0.74, 0.43).normalize() },
     fogColor: { value: new Color("#aebfc6") },
-    fogNear: { value: 560 },
-    fogFar: { value: 1900 },
+    fogNear: { value: 1600 },
+    fogFar: { value: 5200 },
     grassMap: { value: terrainTextures.grass.albedo },
     forestMap: { value: terrainTextures.forest.albedo },
     sandMap: { value: terrainTextures.sand.albedo },
@@ -324,14 +324,14 @@ const terrainShaderMaterial = new ShaderMaterial({
       vec3 rockTex = layeredTexture(rockMap, worldPos, normal, 0.018, 2.8);
       vec3 roadTex = layeredTexture(roadMap, worldPos, normal, 0.046, 2.2);
       vec3 mudTex = layeredTexture(mudMap, worldPos, normal, 0.026, 2.5);
-      if (id < 0.5) return mix(vec3(0.05, 0.22, 0.30), vec3(0.10, 0.34, 0.38), fine);
-      if (id < 1.5) return sandTex * mix(vec3(0.92, 0.86, 0.68), vec3(1.10, 1.02, 0.82), fine);
-      if (id < 2.5) return mix(grassTex, vec3(0.22, 0.31, 0.12), 0.18) * mix(0.66, 1.04, fine * 0.7 + coarse * 0.3);
-      if (id < 3.5) return mix(forestTex, vec3(0.035, 0.10, 0.035), 0.32) * mix(0.58, 0.92, fine);
-      if (id < 4.5) return rockTex * mix(vec3(0.56, 0.55, 0.52), vec3(1.04, 1.00, 0.94), fine);
-      if (id < 5.5) return roadTex * mix(vec3(0.52), vec3(0.92), fine);
-      if (id < 6.5) return mudTex * mix(vec3(0.62, 0.55, 0.46), vec3(0.94, 0.82, 0.66), fine);
-      return vec3(0.76, 0.78, 0.74);
+      if (id < 0.5) return mix(vec3(0.02, 0.13, 0.19), vec3(0.06, 0.30, 0.34), fine);
+      if (id < 1.5) return sandTex * mix(vec3(0.86, 0.76, 0.50), vec3(1.05, 0.94, 0.64), fine);
+      if (id < 2.5) return mix(grassTex, vec3(0.14, 0.27, 0.08), 0.12) * mix(0.72, 1.16, fine * 0.7 + coarse * 0.3);
+      if (id < 3.5) return mix(forestTex, vec3(0.025, 0.085, 0.030), 0.24) * mix(0.62, 0.96, fine);
+      if (id < 4.5) return rockTex * mix(vec3(0.42, 0.40, 0.36), vec3(0.88, 0.82, 0.72), fine);
+      if (id < 5.5) return roadTex * mix(vec3(0.42), vec3(0.72), fine);
+      if (id < 6.5) return mudTex * mix(vec3(0.52, 0.42, 0.32), vec3(0.82, 0.66, 0.48), fine);
+      return vec3(0.46, 0.48, 0.44);
     }
 
     void main() {
@@ -346,7 +346,7 @@ const terrainShaderMaterial = new ShaderMaterial({
         base = mix(base, rock, smoothstep(0.34, 0.78, slope) * 0.82);
       }
       if (vHeight > 50.0 && vBiome > 1.5 && vBiome < 4.7) {
-        base = mix(base, vec3(0.70, 0.72, 0.68), smoothstep(50.0, 70.0, vHeight) * 0.20);
+        base = mix(base, vec3(0.48, 0.48, 0.43), smoothstep(50.0, 70.0, vHeight) * 0.12);
       }
 
       float terrainAO = mix(0.62, 1.0, fbm(p * 0.032));
@@ -361,7 +361,7 @@ const terrainShaderMaterial = new ShaderMaterial({
       color += vec3(0.86, 0.78, 0.62) * microSpec;
 
       float dist = length(cameraPosition - vWorldPosition);
-      float fogFactor = smoothstep(fogNear, fogFar, dist);
+      float fogFactor = smoothstep(fogNear, fogFar, dist) * 0.34;
       gl_FragColor = vec4(mix(color, fogColor, fogFactor), 1.0);
     }
   `,
@@ -385,7 +385,7 @@ const cityPadMaterial = new MeshStandardMaterial({
 const shorelineMaterial = new MeshStandardMaterial({
   color: "#d8eee7",
   transparent: true,
-  opacity: 0.42,
+  opacity: 0.24,
   roughness: 0.88,
   metalness: 0,
   depthWrite: false,
@@ -395,8 +395,8 @@ const waterMaterial = new ShaderMaterial({
   side: DoubleSide,
   uniforms: {
     time: { value: 0 },
-    deepColor: { value: new Color("#0b3447") },
-    shallowColor: { value: new Color("#2e8291") },
+    deepColor: { value: new Color("#062232") },
+    shallowColor: { value: new Color("#1f6673") },
     foamColor: { value: new Color("#d6f2ef") },
     sunDirection: { value: new Vector3(-0.52, 0.74, 0.43).normalize() },
     skyColor: { value: new Color("#8fb9ce") },
@@ -442,17 +442,17 @@ const waterMaterial = new ShaderMaterial({
     void main() {
       vec3 viewDir = normalize(cameraPosition - vWorldPosition);
       vec3 normal = normalize(vec3(vFlow.x * 0.18, 1.0, vFlow.y * 0.18));
-      float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 2.45);
+      float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 3.8);
       float current = sin(vWorldPosition.x * 0.022 + time * 1.5) * sin(vWorldPosition.z * 0.018 - time * 0.9);
       float ripple = sin((vWorldPosition.x + vWorldPosition.z) * 0.12 + time * 3.5) * 0.5 + 0.5;
       float foam = smoothstep(0.58, 1.0, abs(vWave + current * 0.55)) * mix(0.65, 1.25, stormFactor);
-      vec3 base = mix(deepColor, shallowColor, 0.36 + current * 0.18);
+      vec3 base = mix(deepColor, shallowColor, clamp(0.28 + current * 0.16 + ripple * 0.08, 0.0, 1.0));
       float spec = pow(max(dot(reflect(-sunDirection, normal), viewDir), 0.0), mix(96.0, 34.0, stormFactor));
-      vec3 reflected = mix(skyColor, vec3(0.52, 0.62, 0.66), stormFactor);
-      vec3 color = mix(base, reflected, fresnel * 0.82);
+      vec3 reflected = mix(skyColor * 0.62, vec3(0.34, 0.42, 0.46), stormFactor);
+      vec3 color = mix(base, reflected, fresnel * mix(0.24, 0.38, stormFactor));
       color += spec * vec3(1.0, 0.88, 0.66) * mix(1.25, 0.48, stormFactor);
-      color = mix(color, foamColor, foam * (0.20 + ripple * 0.22));
-      gl_FragColor = vec4(color, mix(0.72, 0.86, fresnel));
+      color = mix(color, foamColor, foam * (0.14 + ripple * 0.18));
+      gl_FragColor = vec4(color, mix(0.82, 0.92, fresnel));
     }
   `,
 });
@@ -503,7 +503,7 @@ composer.addPass(ssaoPass);
 composer.addPass(outputPass);
 
 scene.background = new Color("#aebfc6");
-scene.fog = new Fog("#aebfc6", 560, 1900);
+scene.fog = new Fog("#aebfc6", 1600, 5200);
 scene.environment = new PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
 scene.add(new HemisphereLight("#f4f7f4", "#405138", 1.55));
 
@@ -1471,8 +1471,8 @@ function updateEnvironment() {
   sun.position.copy(sunDir).multiplyScalar(900);
   sun.intensity = (3.8 * day) * (storm ? 0.25 : rainWeather ? 0.42 : cloudy ? 0.58 : foggy ? 0.5 : 1);
   renderer.toneMappingExposure = storm ? 0.82 : rainWeather || cloudy ? 0.9 : foggy ? 0.95 : 1.02;
-  const fogNear = storm ? 185 : foggy ? 110 : rainWeather ? 260 : cloudy ? 380 : 560;
-  const fogFar = storm ? 820 : foggy ? 680 : rainWeather ? 1150 : cloudy ? 1450 : 1900;
+  const fogNear = storm ? 620 : foggy ? 260 : rainWeather ? 900 : cloudy ? 1200 : 1600;
+  const fogFar = storm ? 2200 : foggy ? 1200 : rainWeather ? 3000 : cloudy ? 3900 : 5200;
   scene.fog = new Fog(fogColor, fogNear, fogFar);
   renderer.setClearColor(fogColor);
   terrainShaderMaterial.uniforms.sunDirection.value.copy(sunDir);
@@ -1480,7 +1480,7 @@ function updateEnvironment() {
   terrainShaderMaterial.uniforms.fogNear.value = scene.fog.near;
   terrainShaderMaterial.uniforms.fogFar.value = scene.fog.far;
   waterMaterial.uniforms.sunDirection.value.copy(sunDir);
-  waterMaterial.uniforms.skyColor.value.copy(fogColor).lerp(new Color("#8fb9ce"), storm ? 0.18 : 0.52);
+  waterMaterial.uniforms.skyColor.value.copy(fogColor).lerp(new Color("#6f9db7"), storm ? 0.12 : 0.34);
   waterMaterial.uniforms.stormFactor.value = storm ? 1 : rainWeather ? 0.45 : 0;
   if (skyMaterial) {
     skyMaterial.uniforms.timeOfDay.value = skyControls.timeOfDay;
