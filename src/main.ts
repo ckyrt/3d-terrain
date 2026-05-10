@@ -2,9 +2,9 @@ import "./styles.css";
 import {
   ACESFilmicToneMapping,
   BoxGeometry,
+  Box3,
   BufferAttribute,
   BufferGeometry,
-  Clock,
   Color,
   ConeGeometry,
   CylinderGeometry,
@@ -19,7 +19,7 @@ import {
   Mesh,
   MeshStandardMaterial,
   PMREMGenerator,
-  PCFSoftShadowMap,
+  PCFShadowMap,
   PerspectiveCamera,
   PlaneGeometry,
   Points,
@@ -31,10 +31,12 @@ import {
   SphereGeometry,
   SRGBColorSpace,
   TextureLoader,
+  Timer,
   Vector3,
   WebGLRenderer,
 } from "three";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -50,13 +52,14 @@ type MapData = {
   heightmap: ImageData;
 };
 
-const DEFAULT_MAP = "/world-map.png";
-const WORLD_SIZE = 900;
+const DEFAULT_MAP = "/generated-heightmap.png";
+const WORLD_SIZE = 4500;
 const GRID_RESOLUTION = 260;
-const HEIGHT_SCALE = 54;
+const HEIGHT_SCALE = 520;
 const HEIGHT_CONTRAST = 1.03;
-const WATER_LEVEL = 12;
-const EYE_HEIGHT = 8.5;
+const WATER_LEVEL = 72;
+const EYE_HEIGHT = 14;
+const DEBUG_TERRAIN = true;
 
 const biomeColors: Record<Biome, number[]> = {
   water: [0.05, 0.25, 0.34],
@@ -117,6 +120,14 @@ const resetButton = app.querySelector<HTMLButtonElement>("#reset")!;
 const timeButton = app.querySelector<HTMLButtonElement>("#time")!;
 const weatherButton = app.querySelector<HTMLButtonElement>("#weather")!;
 const textureLoader = new TextureLoader();
+const gltfLoader = new GLTFLoader();
+const vegetationAssets = {
+  pines: [] as Group[],
+  broadleaf: [] as Group[],
+  bushes: [] as Group[],
+  grasses: [] as Group[],
+  loaded: false,
+};
 const terrainTextures = {
   grass: {
     albedo: loadTerrainTexture("/assets/textures/grass.jpg"),
@@ -158,10 +169,50 @@ const ssaoPass = new SSAOPass(scene, camera, viewport.clientWidth, viewport.clie
 const outputPass = new OutputPass();
 const terrainMaterial = new MeshStandardMaterial({
   vertexColors: true,
-  roughness: 0.82,
+  roughness: 0.74,
   metalness: 0,
+  envMapIntensity: 0.22,
 });
+const terrainSurfaceMaterials: Partial<Record<Biome, MeshStandardMaterial>> = {
+  sand: new MeshStandardMaterial({
+    vertexColors: true,
+    map: terrainTextures.sand.albedo,
+    normalMap: terrainTextures.sand.normal,
+    roughnessMap: terrainTextures.sand.rough,
+    roughness: 0.86,
+    metalness: 0,
+    envMapIntensity: 0.18,
+  }),
+  grass: new MeshStandardMaterial({
+    vertexColors: true,
+    map: terrainTextures.grass.albedo,
+    normalMap: terrainTextures.grass.normal,
+    roughnessMap: terrainTextures.grass.rough,
+    roughness: 0.78,
+    metalness: 0,
+    envMapIntensity: 0.18,
+  }),
+  forest: new MeshStandardMaterial({
+    vertexColors: true,
+    map: terrainTextures.forest.albedo,
+    normalMap: terrainTextures.forest.normal,
+    roughnessMap: terrainTextures.forest.rough,
+    roughness: 0.84,
+    metalness: 0,
+    envMapIntensity: 0.14,
+  }),
+  rock: new MeshStandardMaterial({
+    vertexColors: true,
+    map: terrainTextures.rock.albedo,
+    normalMap: terrainTextures.rock.normal,
+    roughnessMap: terrainTextures.rock.rough,
+    roughness: 0.68,
+    metalness: 0,
+    envMapIntensity: 0.32,
+  }),
+};
 const terrainShaderMaterial = new ShaderMaterial({
+  name: "terrain-splat-triplanar",
   uniforms: {
     sunDirection: { value: new Vector3(-0.52, 0.74, 0.43).normalize() },
     fogColor: { value: new Color("#aebfc6") },
@@ -179,18 +230,14 @@ const terrainShaderMaterial = new ShaderMaterial({
     rockNormalMap: { value: terrainTextures.rock.normal },
     roadNormalMap: { value: terrainTextures.road.normal },
     mudNormalMap: { value: terrainTextures.mud.normal },
-    grassRoughMap: { value: terrainTextures.grass.rough },
-    forestRoughMap: { value: terrainTextures.forest.rough },
-    sandRoughMap: { value: terrainTextures.sand.rough },
-    rockRoughMap: { value: terrainTextures.rock.rough },
-    roadRoughMap: { value: terrainTextures.road.rough },
-    mudRoughMap: { value: terrainTextures.mud.rough },
   },
   vertexShader: `
+    attribute vec3 color;
     attribute float biome;
     attribute float terrainHeight;
     varying vec3 vWorldPosition;
     varying vec3 vNormal;
+    varying vec3 vVertexColor;
     varying float vBiome;
     varying float vHeight;
 
@@ -198,6 +245,7 @@ const terrainShaderMaterial = new ShaderMaterial({
       vec4 worldPosition = modelMatrix * vec4(position, 1.0);
       vWorldPosition = worldPosition.xyz;
       vNormal = normalize(normalMatrix * normal);
+      vVertexColor = color;
       vBiome = biome;
       vHeight = terrainHeight;
       gl_Position = projectionMatrix * viewMatrix * worldPosition;
@@ -220,14 +268,9 @@ const terrainShaderMaterial = new ShaderMaterial({
     uniform sampler2D rockNormalMap;
     uniform sampler2D roadNormalMap;
     uniform sampler2D mudNormalMap;
-    uniform sampler2D grassRoughMap;
-    uniform sampler2D forestRoughMap;
-    uniform sampler2D sandRoughMap;
-    uniform sampler2D rockRoughMap;
-    uniform sampler2D roadRoughMap;
-    uniform sampler2D mudRoughMap;
     varying vec3 vWorldPosition;
     varying vec3 vNormal;
+    varying vec3 vVertexColor;
     varying float vBiome;
     varying float vHeight;
 
@@ -288,11 +331,6 @@ const terrainShaderMaterial = new ShaderMaterial({
       return normalize(wx * blend.x + wy * blend.y + wz * blend.z);
     }
 
-    float layeredRoughness(sampler2D tex, vec3 worldPos, vec3 normal, float scale) {
-      vec3 r = triPlanar(tex, worldPos, normal, scale);
-      return clamp(dot(r, vec3(0.333)), 0.35, 1.0);
-    }
-
     vec3 detailNormalForBiome(float id, vec3 worldPos, vec3 normal, float slope) {
       vec3 detail = triPlanarNormal(grassNormalMap, worldPos, normal, 0.042);
       if (id > 1.5 && id < 2.5) detail = triPlanarNormal(grassNormalMap, worldPos, normal, 0.045);
@@ -305,12 +343,13 @@ const terrainShaderMaterial = new ShaderMaterial({
     }
 
     float roughnessForBiome(float id, vec3 worldPos, vec3 normal) {
-      if (id < 1.5) return layeredRoughness(sandRoughMap, worldPos, normal, 0.060);
-      if (id < 2.5) return layeredRoughness(grassRoughMap, worldPos, normal, 0.045);
-      if (id < 3.5) return layeredRoughness(forestRoughMap, worldPos, normal, 0.044);
-      if (id < 4.5) return layeredRoughness(rockRoughMap, worldPos, normal, 0.033);
-      if (id < 5.5) return layeredRoughness(roadRoughMap, worldPos, normal, 0.065);
-      if (id < 6.5) return layeredRoughness(mudRoughMap, worldPos, normal, 0.045);
+      float detail = fbm(worldPos.xz * 0.12);
+      if (id < 1.5) return mix(0.82, 0.96, detail);
+      if (id < 2.5) return mix(0.74, 0.92, detail);
+      if (id < 3.5) return mix(0.82, 0.98, detail);
+      if (id < 4.5) return mix(0.62, 0.84, detail);
+      if (id < 5.5) return mix(0.88, 1.00, detail);
+      if (id < 6.5) return mix(0.86, 1.00, detail);
       return 0.92;
     }
 
@@ -318,20 +357,38 @@ const terrainShaderMaterial = new ShaderMaterial({
       vec2 p = worldPos.xz;
       float fine = fbm(p * 0.09);
       float coarse = fbm(p * 0.022);
-      vec3 grassTex = layeredTexture(grassMap, worldPos, normal, 0.022, 3.0);
-      vec3 forestTex = layeredTexture(forestMap, worldPos, normal, 0.024, 2.6);
-      vec3 sandTex = layeredTexture(sandMap, worldPos, normal, 0.036, 2.2);
-      vec3 rockTex = layeredTexture(rockMap, worldPos, normal, 0.018, 2.8);
-      vec3 roadTex = layeredTexture(roadMap, worldPos, normal, 0.046, 2.2);
-      vec3 mudTex = layeredTexture(mudMap, worldPos, normal, 0.026, 2.5);
-      if (id < 0.5) return mix(vec3(0.02, 0.13, 0.19), vec3(0.06, 0.30, 0.34), fine);
-      if (id < 1.5) return sandTex * mix(vec3(0.86, 0.76, 0.50), vec3(1.05, 0.94, 0.64), fine);
-      if (id < 2.5) return mix(grassTex, vec3(0.14, 0.27, 0.08), 0.12) * mix(0.72, 1.16, fine * 0.7 + coarse * 0.3);
-      if (id < 3.5) return mix(forestTex, vec3(0.025, 0.085, 0.030), 0.24) * mix(0.62, 0.96, fine);
-      if (id < 4.5) return rockTex * mix(vec3(0.42, 0.40, 0.36), vec3(0.88, 0.82, 0.72), fine);
-      if (id < 5.5) return roadTex * mix(vec3(0.42), vec3(0.72), fine);
-      if (id < 6.5) return mudTex * mix(vec3(0.52, 0.42, 0.32), vec3(0.82, 0.66, 0.48), fine);
-      return vec3(0.46, 0.48, 0.44);
+      vec3 grassTex = layeredTexture(grassMap, worldPos, normal, 0.074, 2.1);
+      vec3 forestTex = layeredTexture(forestMap, worldPos, normal, 0.068, 2.0);
+      vec3 sandTex = layeredTexture(sandMap, worldPos, normal, 0.082, 1.9);
+      vec3 rockTex = layeredTexture(rockMap, worldPos, normal, 0.052, 2.2);
+      vec3 roadTex = layeredTexture(roadMap, worldPos, normal, 0.092, 1.8);
+      vec3 mudTex = layeredTexture(mudMap, worldPos, normal, 0.070, 2.0);
+      if (id < 0.5) return mix(vec3(0.00, 0.20, 0.34), vec3(0.03, 0.52, 0.64), fine);
+      if (id < 1.5) {
+        vec3 sandBase = mix(vec3(0.78, 0.62, 0.32), vec3(0.96, 0.80, 0.44), fine);
+        return mix(sandBase, sandTex, 0.16);
+      }
+      if (id < 2.5) {
+        vec3 grassBase = mix(vec3(0.15, 0.38, 0.10), vec3(0.38, 0.58, 0.18), fine * 0.7 + coarse * 0.3);
+        return mix(grassBase, grassTex, 0.14);
+      }
+      if (id < 3.5) {
+        vec3 forestBase = mix(vec3(0.035, 0.18, 0.055), vec3(0.11, 0.33, 0.09), fine);
+        return mix(forestBase, forestTex, 0.10);
+      }
+      if (id < 4.5) {
+        vec3 rockBase = mix(vec3(0.36, 0.35, 0.31), vec3(0.62, 0.58, 0.48), fine);
+        return mix(rockBase, rockTex, 0.22);
+      }
+      if (id < 5.5) {
+        vec3 roadBase = mix(vec3(0.28, 0.25, 0.21), vec3(0.48, 0.42, 0.34), fine);
+        return mix(roadBase, roadTex, 0.18);
+      }
+      if (id < 6.5) {
+        vec3 mudBase = mix(vec3(0.36, 0.22, 0.12), vec3(0.62, 0.42, 0.22), fine);
+        return mix(mudBase, mudTex, 0.18);
+      }
+      return vec3(0.82, 0.84, 0.80);
     }
 
     void main() {
@@ -340,24 +397,31 @@ const terrainShaderMaterial = new ShaderMaterial({
       vec2 p = vWorldPosition.xz;
       vec3 n = detailNormalForBiome(vBiome, vWorldPosition, geoNormal, slope);
       float roughness = roughnessForBiome(vBiome, vWorldPosition, geoNormal);
-      vec3 base = biomeColor(vBiome, vWorldPosition, geoNormal, slope);
-      vec3 rock = layeredTexture(rockMap, vWorldPosition, geoNormal, 0.021, 2.7) * mix(vec3(0.48), vec3(0.96), fbm(p * 0.075));
+      vec3 base = vVertexColor;
+      vec3 materialDetail = biomeColor(vBiome, vWorldPosition, geoNormal, slope);
+      float textureInfluence = vBiome < 0.5 ? 0.0 : vBiome < 1.5 ? 0.42 : vBiome < 2.5 ? 0.52 : vBiome < 3.5 ? 0.48 : vBiome < 4.5 ? 0.64 : 0.46;
+      base = mix(base, materialDetail, textureInfluence);
+      float macroBreakup = mix(0.76, 1.12, fbm(p * 0.006)) * mix(0.90, 1.08, fbm(p * 0.038));
+      base *= macroBreakup;
+      vec3 rock = layeredTexture(rockMap, vWorldPosition, geoNormal, 0.056, 2.1) * mix(vec3(0.48), vec3(0.96), fbm(p * 0.075));
       if ((vBiome > 1.5 && vBiome < 3.6) && slope > 0.34) {
         base = mix(base, rock, smoothstep(0.34, 0.78, slope) * 0.82);
       }
-      if (vHeight > 50.0 && vBiome > 1.5 && vBiome < 4.7) {
+      if (vHeight > 50.0 && vBiome > 3.5 && vBiome < 4.7) {
         base = mix(base, vec3(0.48, 0.48, 0.43), smoothstep(50.0, 70.0, vHeight) * 0.12);
       }
 
-      float terrainAO = mix(0.62, 1.0, fbm(p * 0.032));
-      float fineDirt = mix(0.86, 1.08, fbm(p * 0.48));
+      float terrainAO = mix(0.58, 1.0, fbm(p * 0.018));
+      float fineDirt = mix(0.88, 1.08, fbm(p * 0.20));
       float diffuse = max(dot(n, normalize(sunDirection)), 0.0);
-      float wrapped = diffuse * 0.72 + 0.28;
-      float hemi = 0.34 + n.y * 0.46;
-      float slopeShade = mix(1.0, 0.72, smoothstep(0.38, 0.88, slope));
+      float wrapped = diffuse * 0.82 + 0.18;
+      float hemi = 0.26 + n.y * 0.52;
+      float slopeShade = mix(1.0, 0.62, smoothstep(0.32, 0.86, slope));
+      float heightShade = mix(0.92, 1.08, smoothstep(8.0, 58.0, vHeight));
       vec3 halfDir = normalize(normalize(sunDirection) + normalize(cameraPosition - vWorldPosition));
-      float microSpec = pow(max(dot(n, halfDir), 0.0), mix(16.0, 4.0, roughness)) * (1.0 - roughness) * 0.08;
-      vec3 color = base * (hemi + wrapped * 0.88) * terrainAO * fineDirt * slopeShade;
+      float microSpec = pow(max(dot(n, halfDir), 0.0), mix(28.0, 5.0, roughness)) * (1.0 - roughness) * 0.10;
+      vec3 color = base * (hemi + wrapped * 0.94) * terrainAO * fineDirt * slopeShade * heightShade;
+      color = pow(max(color, vec3(0.0)), vec3(0.92));
       color += vec3(0.86, 0.78, 0.62) * microSpec;
 
       float dist = length(cameraPosition - vWorldPosition);
@@ -390,28 +454,40 @@ const shorelineMaterial = new MeshStandardMaterial({
   metalness: 0,
   depthWrite: false,
 });
+const simpleWaterMaterial = new MeshStandardMaterial({
+  color: "#0284bd",
+  emissive: "#003c63",
+  emissiveIntensity: 0.14,
+  roughness: 0.18,
+  metalness: 0,
+  envMapIntensity: 0.75,
+});
 const waterMaterial = new ShaderMaterial({
-  transparent: true,
+  transparent: false,
+  depthWrite: true,
+  depthTest: true,
   side: DoubleSide,
   uniforms: {
     time: { value: 0 },
-    deepColor: { value: new Color("#062232") },
-    shallowColor: { value: new Color("#1f6673") },
+    deepColor: { value: new Color("#001c34") },
+    shallowColor: { value: new Color("#005f86") },
     foamColor: { value: new Color("#d6f2ef") },
     sunDirection: { value: new Vector3(-0.52, 0.74, 0.43).normalize() },
-    skyColor: { value: new Color("#8fb9ce") },
+    skyColor: { value: new Color("#0b2638") },
     stormFactor: { value: 0 },
   },
   vertexShader: `
+    uniform float time;
     varying vec3 vWorldPosition;
     varying float vWave;
     varying vec2 vFlow;
 
     float wave(vec2 p, float t) {
-      return sin(p.x * 0.045 + t * 1.7) * 0.55
-        + sin((p.x + p.y) * 0.028 + t * 1.13) * 0.75
-        + sin(p.y * 0.064 - t * 2.15) * 0.28
-        + sin(length(p) * 0.038 - t * 1.25) * 0.35;
+      return sin(p.x * 0.052 + t * 1.7) * 0.46
+        + sin((p.x + p.y) * 0.033 + t * 1.13) * 0.54
+        + sin(p.y * 0.079 - t * 2.15) * 0.24
+        + sin(length(p) * 0.046 - t * 1.25) * 0.25
+        + sin((p.x * 0.41 - p.y * 0.23) + t * 4.1) * 0.045;
     }
 
     void main() {
@@ -439,20 +515,27 @@ const waterMaterial = new ShaderMaterial({
     varying float vWave;
     varying vec2 vFlow;
 
+    float rippleNoise(vec2 p) {
+      return sin(p.x * 0.18 + time * 2.4) * sin(p.y * 0.21 - time * 1.7);
+    }
+
     void main() {
+      vec2 p = vWorldPosition.xz;
       vec3 viewDir = normalize(cameraPosition - vWorldPosition);
-      vec3 normal = normalize(vec3(vFlow.x * 0.18, 1.0, vFlow.y * 0.18));
-      float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 3.8);
-      float current = sin(vWorldPosition.x * 0.022 + time * 1.5) * sin(vWorldPosition.z * 0.018 - time * 0.9);
-      float ripple = sin((vWorldPosition.x + vWorldPosition.z) * 0.12 + time * 3.5) * 0.5 + 0.5;
-      float foam = smoothstep(0.58, 1.0, abs(vWave + current * 0.55)) * mix(0.65, 1.25, stormFactor);
-      vec3 base = mix(deepColor, shallowColor, clamp(0.28 + current * 0.16 + ripple * 0.08, 0.0, 1.0));
-      float spec = pow(max(dot(reflect(-sunDirection, normal), viewDir), 0.0), mix(96.0, 34.0, stormFactor));
-      vec3 reflected = mix(skyColor * 0.62, vec3(0.34, 0.42, 0.46), stormFactor);
-      vec3 color = mix(base, reflected, fresnel * mix(0.24, 0.38, stormFactor));
-      color += spec * vec3(1.0, 0.88, 0.66) * mix(1.25, 0.48, stormFactor);
-      color = mix(color, foamColor, foam * (0.14 + ripple * 0.18));
-      gl_FragColor = vec4(color, mix(0.82, 0.92, fresnel));
+      vec3 normal = normalize(vec3(vFlow.x * 0.16, 1.0, vFlow.y * 0.16));
+      float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 4.4);
+      float current = sin(p.x * 0.022 + time * 1.5) * sin(p.y * 0.018 - time * 0.9);
+      float longWave = sin(p.x * 0.09 + time * 1.7) * 0.5 + 0.5;
+      float travelingRipples = sin(p.x * 0.86 + p.y * 0.28 + time * 6.2) * 0.5 + 0.5;
+      float crossRipples = sin(p.x * -0.38 + p.y * 0.92 - time * 5.0) * 0.5 + 0.5;
+      float foam = smoothstep(0.78, 1.16, abs(vWave + current * 0.42));
+      vec3 color = mix(vec3(0.0, 0.08, 0.22), vec3(0.0, 0.36, 0.58), 0.30 + longWave * 0.18);
+      color += vec3(0.0, 0.24, 0.34) * travelingRipples * 0.14;
+      color += vec3(0.12, 0.48, 0.58) * crossRipples * 0.09;
+      float spec = pow(max(dot(reflect(-sunDirection, normal), viewDir), 0.0), 96.0);
+      color += vec3(1.0, 0.86, 0.62) * spec * 0.55;
+      color = mix(color, foamColor, foam * 0.08);
+      gl_FragColor = vec4(color, 1.0);
     }
   `,
 });
@@ -460,13 +543,14 @@ const terrainGroup = new Group();
 const scratchMatrix = new Matrix4();
 const scratchQuat = new Quaternion();
 const scratchEuler = new Euler();
-const clock = new Clock();
+const timer = new Timer();
+timer.connect(document);
 const moveKeys = new Set<string>();
 const weatherModes: Weather[] = ["clear", "cloudy", "rain", "storm", "fog"];
 const skyControls = {
-  timeOfDay: 0.36,
+  timeOfDay: 0.25,
   weatherIndex: 0,
-  autoTime: true,
+  autoTime: false,
 };
 const terrainSample = {
   heights: undefined as Float32Array | undefined,
@@ -477,9 +561,10 @@ const walkForward = new Vector3();
 const walkRight = new Vector3();
 let yaw = -0.74;
 let pitch = -0.28;
-let terrainMesh: Mesh<BufferGeometry, ShaderMaterial> | undefined;
+let terrainMeshes: Mesh[] = [];
 let waterMesh: Mesh<BufferGeometry, ShaderMaterial> | undefined;
 let skyMaterial: ShaderMaterial | undefined;
+let skyDome: Mesh<SphereGeometry, ShaderMaterial> | undefined;
 let cloudMaterial: ShaderMaterial | undefined;
 let cloudDeck: Mesh<PlaneGeometry, ShaderMaterial> | undefined;
 let rain: Points<BufferGeometry, PointsMaterial> | undefined;
@@ -489,15 +574,16 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
 renderer.setClearColor("#b9cbd2");
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = PCFSoftShadowMap;
+renderer.shadowMap.type = PCFShadowMap;
+renderer.outputColorSpace = SRGBColorSpace;
 renderer.toneMapping = ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.02;
+renderer.toneMappingExposure = 1.08;
 viewport.append(renderer.domElement);
 viewport.tabIndex = 0;
 renderer.domElement.tabIndex = 0;
-ssaoPass.kernelRadius = 18;
+ssaoPass.kernelRadius = 24;
 ssaoPass.minDistance = 0.001;
-ssaoPass.maxDistance = 0.18;
+ssaoPass.maxDistance = 0.24;
 composer.addPass(renderPass);
 composer.addPass(ssaoPass);
 composer.addPass(outputPass);
@@ -505,9 +591,9 @@ composer.addPass(outputPass);
 scene.background = new Color("#aebfc6");
 scene.fog = new Fog("#aebfc6", 1600, 5200);
 scene.environment = new PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
-scene.add(new HemisphereLight("#f4f7f4", "#405138", 1.55));
+scene.add(new HemisphereLight("#eaf3f6", "#314128", 1.05));
 
-const sun = new DirectionalLight("#ffe8c2", 3.8);
+const sun = new DirectionalLight("#ffe0b0", 4.6);
 sun.position.set(-440, 620, 360);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
@@ -517,16 +603,22 @@ sun.shadow.camera.left = -620;
 sun.shadow.camera.right = 620;
 sun.shadow.camera.top = 620;
 sun.shadow.camera.bottom = -620;
+sun.shadow.bias = -0.00008;
+sun.shadow.normalBias = 0.045;
 scene.add(sun);
 scene.add(terrainGroup);
 addSkyDome();
 
 attachUi();
 resetCamera();
-loadMap(DEFAULT_MAP, "world map").catch((error) => {
+loadVegetationAssets()
+  .catch((error) => {
+    console.warn("Vegetation models failed to load; using procedural fallback.", error);
+  })
+  .finally(() => loadMap(DEFAULT_MAP, "world map").catch((error) => {
   sourceMetric.textContent = "load failed";
   console.error(error);
-});
+}));
 animate();
 
 function attachUi() {
@@ -578,7 +670,14 @@ function attachUi() {
 
 function activateControls() {
   activateFocusOnly();
-  renderer.domElement.requestPointerLock?.();
+  try {
+    const lockRequest = renderer.domElement.requestPointerLock?.();
+    if (lockRequest instanceof Promise) {
+      lockRequest.catch((error) => console.warn("[terrain] pointer lock skipped", error));
+    }
+  } catch (error) {
+    console.warn("[terrain] pointer lock skipped", error);
+  }
 }
 
 function activateFocusOnly() {
@@ -638,8 +737,11 @@ function updateControlLabels() {
 
 async function loadMap(url: string, label: string) {
   sourceMetric.textContent = "loading";
+  console.time("[terrain] load map");
   const image = await loadImage(url);
+  console.log("[terrain] image loaded", { url, width: image.naturalWidth, height: image.naturalHeight });
   currentMap = extractMapData(image);
+  console.timeEnd("[terrain] load map");
   buildTerrain(currentMap);
   sourceMetric.textContent = label.replace(/\.[^.]+$/, "");
 }
@@ -656,21 +758,27 @@ function extractMapData(image: HTMLImageElement): MapData {
 
   ctx.drawImage(image, 0, 0);
 
+  const looksLikePanelSheet = image.naturalWidth > image.naturalHeight * 2.2;
   const sectionWidth = Math.floor(image.naturalWidth / 3);
-  const yBand = findContentBand(ctx, sectionWidth, image.naturalHeight);
-  const inset = 8;
-  const panelWidth = sectionWidth - inset * 2;
+  const yBand = looksLikePanelSheet ? findContentBand(ctx, sectionWidth, image.naturalHeight) : { y: 0, height: image.naturalHeight };
+  const inset = looksLikePanelSheet ? 8 : 0;
+  const panelWidth = (looksLikePanelSheet ? sectionWidth : image.naturalWidth) - inset * 2;
   const panelHeight = yBand.height - inset * 2;
+  const heightmapX = looksLikePanelSheet ? sectionWidth * 2 + inset : 0;
+  const heightmapY = yBand.y + inset;
+  const heightmap = ctx.getImageData(heightmapX, heightmapY, panelWidth, panelHeight);
 
   return {
     width: panelWidth,
     height: panelHeight,
-    layout: ctx.getImageData(sectionWidth + inset, yBand.y + inset, panelWidth, panelHeight),
-    heightmap: ctx.getImageData(sectionWidth * 2 + inset, yBand.y + inset, panelWidth, panelHeight),
+    layout: heightmap,
+    heightmap,
   };
 }
 
 function buildTerrain(map: MapData) {
+  console.time("[terrain] build total");
+  console.log("[terrain] build start", { mapWidth: map.width, mapHeight: map.height, grid: GRID_RESOLUTION, worldSize: WORLD_SIZE });
   clearTerrain();
 
   const resolution = GRID_RESOLUTION;
@@ -690,19 +798,8 @@ function buildTerrain(map: MapData) {
     for (let x = 0; x < verticesPerSide; x += 1) {
       const u = x / resolution;
       const v = z / resolution;
-      const heightPixel = samplePixel(map.heightmap, u, v);
-      const layoutPixel = samplePixel(map.layout, u, v);
-      const biome = classifyBiome(layoutPixel);
-      const luminance = sampleBlurredHeight(map.heightmap, u, v);
-      let height = Math.pow(luminance, HEIGHT_CONTRAST) * HEIGHT_SCALE;
-
-      if (biome === "water") height = Math.min(height, seaLevel - 7);
-      if (biome === "sand") height = Math.max(height, seaLevel + 1);
-      if (biome === "road") height = Math.max(Math.min(height, 18), seaLevel + 1.9);
-      if (biome === "building") height = Math.max(Math.min(height, 20), seaLevel + 3);
-      if ((biome === "grass" || biome === "forest") && height > 58) {
-        height = 58 + (height - 58) * 0.24;
-      }
+      let height = heightForHeightmap(map.heightmap, seaLevel, u, v);
+      if (!Number.isFinite(height)) height = seaLevel + 8;
 
       positions[vertex * 3] = u * WORLD_SIZE - half;
       positions[vertex * 3 + 1] = height;
@@ -710,22 +807,47 @@ function buildTerrain(map: MapData) {
       uvs[vertex * 2] = u;
       uvs[vertex * 2 + 1] = 1 - v;
       heights[vertex] = height;
-      biomeAt[vertex] = biome;
-      biomeIdsAt[vertex] = biomeIds[biome];
       vertex += 1;
     }
   }
+  logHeightStats("raw", heights, seaLevel);
+
+  console.time("[terrain] reshape");
+  reshapeTerrainHeights(heights, verticesPerSide, seaLevel);
+  clampHeights(heights, seaLevel - 18, seaLevel + 220);
+  console.timeEnd("[terrain] reshape");
+  logHeightStats("reshaped", heights, seaLevel);
+  for (let i = 0; i < heights.length; i += 1) {
+    positions[i * 3 + 1] = heights[i];
+  }
+
+  console.time("[terrain] flow");
+  let terrainAnalysis = analyzeTerrain(heights, verticesPerSide, seaLevel);
+  console.timeEnd("[terrain] flow");
+  for (let i = 0; i < heights.length; i += 1) {
+    const riverCut = smoothstep(0.60, 0.88, terrainAnalysis.flow[i]) * smoothstep(seaLevel + 10, seaLevel + 230, heights[i]) * 18;
+    heights[i] = Math.max(seaLevel - 16, heights[i] - riverCut);
+    positions[i * 3 + 1] = heights[i];
+  }
+  console.time("[terrain] final relax");
+  relaxTerrainSlopes(heights, verticesPerSide, seaLevel, 3);
+  clampHeights(heights, seaLevel - 18, seaLevel + 220);
+  console.timeEnd("[terrain] final relax");
+  logHeightStats("final", heights, seaLevel);
+  for (let i = 0; i < heights.length; i += 1) {
+    positions[i * 3 + 1] = heights[i];
+  }
+  console.time("[terrain] final flow");
+  terrainAnalysis = analyzeTerrain(heights, verticesPerSide, seaLevel);
+  console.timeEnd("[terrain] final flow");
 
   for (let z = 0; z < verticesPerSide; z += 1) {
     for (let x = 0; x < verticesPerSide; x += 1) {
       const index = z * verticesPerSide + x;
-      const left = heights[z * verticesPerSide + Math.max(0, x - 1)];
-      const right = heights[z * verticesPerSide + Math.min(verticesPerSide - 1, x + 1)];
-      const down = heights[Math.max(0, z - 1) * verticesPerSide + x];
-      const up = heights[Math.min(verticesPerSide - 1, z + 1) * verticesPerSide + x];
-      const slope = Math.hypot(right - left, up - down) / (WORLD_SIZE / resolution);
+      const slope = terrainAnalysis.slope[index];
+      const biome = biomeForTerrain(heights[index], slope, terrainAnalysis.moisture[index], terrainAnalysis.flow[index], seaLevel);
       const color = colorForSurface(
-        biomeAt[index],
+        biome,
         heights[index],
         slope,
         seaLevel,
@@ -733,11 +855,14 @@ function buildTerrain(map: MapData) {
         z / (verticesPerSide - 1),
       );
 
+      biomeAt[index] = biome;
+      biomeIdsAt[index] = biomeIds[biome];
       colors[index * 3] = color[0];
       colors[index * 3 + 1] = color[1];
       colors[index * 3 + 2] = color[2];
     }
   }
+  const terrainNormals = buildTerrainNormals(heights, verticesPerSide);
 
   let cursor = 0;
   for (let z = 0; z < resolution; z += 1) {
@@ -764,45 +889,60 @@ function buildTerrain(map: MapData) {
   geometry.setIndex(new BufferAttribute(indices, 1));
   geometry.computeVertexNormals();
 
-  terrainMesh = new Mesh(geometry, terrainShaderMaterial);
-  terrainMesh.receiveShadow = true;
-  terrainGroup.add(terrainMesh);
+  terrainMeshes = [];
+  const surfaceMesh = new Mesh(geometry, terrainShaderMaterial);
+  surfaceMesh.receiveShadow = true;
+  terrainMeshes.push(surfaceMesh);
+  terrainGroup.add(surfaceMesh);
 
   waterMesh = new Mesh(buildWaterGeometry(biomeAt, verticesPerSide, seaLevel), waterMaterial);
+  waterMesh.name = "diagnostic-deep-blue-water";
+  waterMesh.frustumCulled = false;
+  waterMesh.renderOrder = 40;
   terrainGroup.add(waterMesh);
-  terrainGroup.add(new Mesh(buildShorelineGeometry(biomeAt, heights, verticesPerSide, seaLevel), shorelineMaterial));
-  terrainGroup.add(new Mesh(buildMaskGeometry(biomeAt, heights, verticesPerSide, "road", 0.24), roadMaterial));
-  terrainGroup.add(new Mesh(buildMaskGeometry(biomeAt, heights, verticesPerSide, "building", 0.18), cityPadMaterial));
+  const shorelineMesh = new Mesh(buildShorelineGeometry(biomeAt, heights, verticesPerSide, seaLevel), shorelineMaterial);
+  shorelineMesh.renderOrder = 42;
+  terrainGroup.add(shorelineMesh);
+  terrainGroup.add(new Mesh(buildMaskGeometry(biomeAt, heights, verticesPerSide, "road", 0.08), roadMaterial));
+  terrainGroup.add(new Mesh(buildMaskGeometry(biomeAt, heights, verticesPerSide, "building", 0.1), cityPadMaterial));
   terrainSample.heights = heights;
   terrainSample.verticesPerSide = verticesPerSide;
 
   addDetails(map, heights, biomeAt, verticesPerSide);
+  console.timeEnd("[terrain] build total");
 }
 
 function addDetails(map: MapData, heights: Float32Array, biomeAt: Biome[], verticesPerSide: number) {
-  const treeCrownGeometry = new ConeGeometry(5.2, 18, 7);
-  const treeTrunkGeometry = new CylinderGeometry(0.85, 1.15, 7, 5);
-  const bushGeometry = new SphereGeometry(3.4, 8, 6);
-  const grassGeometry = new PlaneGeometry(1.35, 5.2, 1, 2);
+  const pineTrunkGeometry = new CylinderGeometry(0.22, 0.42, 5.2, 7);
+  const pineLowerGeometry = new ConeGeometry(2.9, 5.6, 9);
+  const pineMidGeometry = new ConeGeometry(2.25, 4.9, 9);
+  const pineTopGeometry = new ConeGeometry(1.45, 3.8, 9);
+  const broadTrunkGeometry = new CylinderGeometry(0.32, 0.62, 5.6, 7);
+  const broadCrownGeometry = new SphereGeometry(2.8, 10, 8);
+  const bushGeometry = new SphereGeometry(1.8, 9, 7);
+  const grassGeometry = new PlaneGeometry(0.45, 1.7, 1, 2);
   const rockGeometry = new ConeGeometry(4.5, 8, 6);
   const pebbleGeometry = new BoxGeometry(2.8, 1.2, 2.2);
-  const treeCrownMaterial = new MeshStandardMaterial({ color: "#163719", roughness: 1, metalness: 0 });
-  const treeTrunkMaterial = new MeshStandardMaterial({ color: "#3d2b1e", roughness: 1, metalness: 0 });
-  const bushMaterial = new MeshStandardMaterial({ color: "#1f4a21", roughness: 1, metalness: 0 });
+  const pineMaterial = new MeshStandardMaterial({ color: "#153f20", roughness: 0.9, metalness: 0, envMapIntensity: 0.08, vertexColors: true });
+  const pineDarkMaterial = new MeshStandardMaterial({ color: "#0f3018", roughness: 0.94, metalness: 0, envMapIntensity: 0.06, vertexColors: true });
+  const broadleafMaterial = new MeshStandardMaterial({ color: "#2f5c24", roughness: 0.88, metalness: 0, envMapIntensity: 0.1, vertexColors: true });
+  const treeTrunkMaterial = new MeshStandardMaterial({ color: "#4a2e1d", roughness: 0.96, metalness: 0, vertexColors: true });
+  const bushMaterial = new MeshStandardMaterial({ color: "#1c5a27", roughness: 0.92, metalness: 0, envMapIntensity: 0.08, vertexColors: true });
   const grassMaterial = new MeshStandardMaterial({
-    color: "#405b25",
-    roughness: 1,
+    color: "#4c6b2b",
+    roughness: 0.96,
     metalness: 0,
     side: DoubleSide,
+    vertexColors: true,
   });
-  const rockMaterial = new MeshStandardMaterial({ color: "#6a665d", roughness: 1, metalness: 0 });
-  const pebbleMaterial = new MeshStandardMaterial({ color: "#7a766d", roughness: 1, metalness: 0 });
+  const rockMaterial = new MeshStandardMaterial({ color: "#665f54", roughness: 0.88, metalness: 0, envMapIntensity: 0.16 });
+  const pebbleMaterial = new MeshStandardMaterial({ color: "#777064", roughness: 0.9, metalness: 0 });
   const treeCandidates: number[] = [];
   const bushCandidates: number[] = [];
   const grassCandidates: number[] = [];
   const rockCandidates: number[] = [];
   const pebbleCandidates: number[] = [];
-  const step = 4;
+  const step = 3;
 
   for (let z = 0; z < verticesPerSide; z += step) {
     for (let x = 0; x < verticesPerSide; x += step) {
@@ -812,38 +952,147 @@ function addDetails(map: MapData, heights: Float32Array, biomeAt: Biome[], verti
       const v = z / (verticesPerSide - 1);
       const jitter = hash01(x, z, 4);
       const slopeHint = Math.abs(sampleBlurredHeight(map.heightmap, u + 0.006, v) - sampleBlurredHeight(map.heightmap, u - 0.006, v));
+      const forestMass = valueNoise01(u, v, 5.2, 140) * 0.72 + valueNoise01(u, v, 15.0, 141) * 0.28;
+      const meadowBreak = valueNoise01(u, v, 10.0, 151);
+      const valleyOpen = smoothstep(0.56, 0.86, sampleBlurredHeight(map.heightmap, u, v, 10));
+      const woodlandDensity = Math.max(0, forestMass - valleyOpen * 0.22);
+      const forestEdge = smoothstep(0.36, 0.62, woodlandDensity) * (1 - smoothstep(0.72, 0.92, meadowBreak));
+      const grassDensity = smoothstep(0.24, 0.68, meadowBreak) * (1 - Math.min(0.82, slopeHint * 5.2));
 
-      if (biome === "forest" && jitter > 0.16) treeCandidates.push(index);
-      if (biome === "grass" && jitter > 0.86) treeCandidates.push(index);
-      if ((biome === "forest" || biome === "grass") && jitter > 0.58) bushCandidates.push(index);
-      if ((biome === "grass" || biome === "forest") && jitter > 0.38) grassCandidates.push(index);
+      if (biome === "forest" && jitter < 0.34 + forestEdge * 0.58) treeCandidates.push(index);
+      if (biome === "grass" && forestEdge > 0.46 && jitter < 0.10 + forestEdge * 0.30) treeCandidates.push(index);
+      if ((biome === "forest" || biome === "grass") && jitter < 0.18 + Math.max(forestEdge, grassDensity) * 0.50) bushCandidates.push(index);
+      if ((biome === "grass" || biome === "forest") && jitter < 0.24 + grassDensity * 0.66) grassCandidates.push(index);
       if ((biome === "rock" || biome === "snow" || slopeHint > 0.08) && jitter > 0.72) rockCandidates.push(index);
       if ((biome === "sand" || biome === "rock" || slopeHint > 0.045) && jitter > 0.62) pebbleCandidates.push(index);
     }
   }
 
+  if (vegetationAssets.loaded) {
+    addVegetationModelInstances(treeCandidates, bushCandidates, grassCandidates, heights, verticesPerSide);
+    const groundCoverCount = Math.min(grassCandidates.length, 3600);
+    const groundCover = new InstancedMesh(grassGeometry, grassMaterial, groundCoverCount);
+    groundCover.castShadow = true;
+    groundCover.receiveShadow = true;
+    grassCandidates.slice(0, groundCoverCount).forEach((index, instance) => {
+      const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.52);
+      const scale = 0.42 + hash01(index, instance, 133) * 0.82;
+      scratchEuler.set((hash01(index, instance, 134) - 0.5) * 0.18, hash01(index, instance, 135) * Math.PI * 2, (hash01(index, instance, 136) - 0.5) * 0.18);
+      scratchQuat.setFromEuler(scratchEuler);
+      scratchMatrix.compose(
+        new Vector3(x, heights[index] + 0.8 * scale, z),
+        scratchQuat,
+        new Vector3(scale, scale, scale),
+      );
+      groundCover.setMatrixAt(instance, scratchMatrix);
+      groundCover.setColorAt(instance, new Color("#314f22").lerp(new Color("#6a7a32"), hash01(index, instance, 137)));
+    });
+    terrainGroup.add(groundCover);
+  } else {
   const treeCount = Math.min(treeCandidates.length, 2800);
-  const treeCrowns = new InstancedMesh(treeCrownGeometry, treeCrownMaterial, treeCount);
-  const treeTrunks = new InstancedMesh(treeTrunkGeometry, treeTrunkMaterial, treeCount);
-  treeCrowns.castShadow = true;
-  treeTrunks.castShadow = true;
-  treeCandidates.slice(0, treeCount).forEach((index, instance) => {
-    const { x, z } = positionsFromIndex(index, verticesPerSide);
-    const scale = 0.75 + hash01(index, instance, 7) * 0.7;
-    scratchMatrix.makeScale(scale, scale, scale);
-    scratchMatrix.setPosition(x, heights[index] + 13 * scale, z);
-    treeCrowns.setMatrixAt(instance, scratchMatrix);
-    scratchMatrix.makeScale(scale * 0.85, scale, scale * 0.85);
-    scratchMatrix.setPosition(x, heights[index] + 3.2 * scale, z);
-    treeTrunks.setMatrixAt(instance, scratchMatrix);
+  const pineCandidates = treeCandidates.slice(0, treeCount).filter((index) => hash01(index, 2, 71) < 0.72);
+  const broadleafCandidates = treeCandidates.slice(0, treeCount).filter((index) => hash01(index, 2, 71) >= 0.72);
+  const pineCount = pineCandidates.length;
+  const broadleafCount = broadleafCandidates.length;
+  const pineTrunks = new InstancedMesh(pineTrunkGeometry, treeTrunkMaterial, pineCount);
+  const pineLower = new InstancedMesh(pineLowerGeometry, pineDarkMaterial, pineCount);
+  const pineMid = new InstancedMesh(pineMidGeometry, pineMaterial, pineCount);
+  const pineTop = new InstancedMesh(pineTopGeometry, pineMaterial, pineCount);
+  const broadTrunks = new InstancedMesh(broadTrunkGeometry, treeTrunkMaterial, broadleafCount);
+  const broadCrownsA = new InstancedMesh(broadCrownGeometry, broadleafMaterial, broadleafCount);
+  const broadCrownsB = new InstancedMesh(broadCrownGeometry, broadleafMaterial, broadleafCount);
+  for (const mesh of [pineTrunks, pineLower, pineMid, pineTop, broadTrunks, broadCrownsA, broadCrownsB]) {
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+  }
+
+  pineCandidates.forEach((index, instance) => {
+    const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.46);
+    const scale = 0.72 + hash01(index, instance, 7) * 0.58;
+    const heightScale = 0.82 + hash01(index, instance, 8) * 0.46;
+    const leanX = (hash01(index, instance, 9) - 0.5) * 0.11;
+    const leanZ = (hash01(index, instance, 10) - 0.5) * 0.11;
+    const yawAmount = hash01(index, instance, 11) * Math.PI * 2;
+    const foliageColor = new Color("#123a1c").lerp(new Color("#2f5a28"), hash01(index, instance, 12));
+    const trunkColor = new Color("#382516").lerp(new Color("#624025"), hash01(index, instance, 13));
+    scratchEuler.set(leanX, yawAmount, leanZ);
+    scratchQuat.setFromEuler(scratchEuler);
+
+    scratchMatrix.compose(
+      new Vector3(x, heights[index] + 2.5 * heightScale * scale, z),
+      scratchQuat,
+      new Vector3(scale * 0.9, heightScale * scale, scale * 0.9),
+    );
+    pineTrunks.setMatrixAt(instance, scratchMatrix);
+    pineTrunks.setColorAt(instance, trunkColor);
+
+    scratchMatrix.compose(
+      new Vector3(x, heights[index] + 6.4 * heightScale * scale, z),
+      scratchQuat,
+      new Vector3(scale * 1.18, heightScale * scale, scale * 1.18),
+    );
+    pineLower.setMatrixAt(instance, scratchMatrix);
+    pineLower.setColorAt(instance, foliageColor.clone().multiplyScalar(0.78));
+
+    scratchMatrix.compose(
+      new Vector3(x, heights[index] + 9.2 * heightScale * scale, z),
+      scratchQuat,
+      new Vector3(scale * 0.98, heightScale * scale, scale * 0.98),
+    );
+    pineMid.setMatrixAt(instance, scratchMatrix);
+    pineMid.setColorAt(instance, foliageColor);
+
+    scratchMatrix.compose(
+      new Vector3(x, heights[index] + 11.8 * heightScale * scale, z),
+      scratchQuat,
+      new Vector3(scale * 0.78, heightScale * scale, scale * 0.78),
+    );
+    pineTop.setMatrixAt(instance, scratchMatrix);
+    pineTop.setColorAt(instance, foliageColor.clone().multiplyScalar(1.08));
   });
-  terrainGroup.add(treeTrunks, treeCrowns);
+
+  broadleafCandidates.forEach((index, instance) => {
+    const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.44);
+    const scale = 0.72 + hash01(index, instance, 31) * 0.62;
+    const canopyY = heights[index] + 5.6 * scale;
+    const yawAmount = hash01(index, instance, 32) * Math.PI * 2;
+    const foliageColor = new Color("#244a1e").lerp(new Color("#4f6f2c"), hash01(index, instance, 33));
+    const trunkColor = new Color("#3c2718").lerp(new Color("#6b4628"), hash01(index, instance, 34));
+    scratchEuler.set((hash01(index, instance, 35) - 0.5) * 0.12, yawAmount, (hash01(index, instance, 36) - 0.5) * 0.12);
+    scratchQuat.setFromEuler(scratchEuler);
+
+    scratchMatrix.compose(
+      new Vector3(x, heights[index] + 2.8 * scale, z),
+      scratchQuat,
+      new Vector3(scale * 0.82, scale, scale * 0.82),
+    );
+    broadTrunks.setMatrixAt(instance, scratchMatrix);
+    broadTrunks.setColorAt(instance, trunkColor);
+
+    scratchMatrix.compose(
+      new Vector3(x - 1.2 * scale, canopyY, z),
+      scratchQuat,
+      new Vector3(scale * 1.45, scale * 0.96, scale * 1.18),
+    );
+    broadCrownsA.setMatrixAt(instance, scratchMatrix);
+    broadCrownsA.setColorAt(instance, foliageColor);
+
+    scratchMatrix.compose(
+      new Vector3(x + 0.9 * scale, canopyY + 0.65 * scale, z + 0.45 * scale),
+      scratchQuat,
+      new Vector3(scale * 1.1, scale * 0.82, scale * 1.32),
+    );
+    broadCrownsB.setMatrixAt(instance, scratchMatrix);
+    broadCrownsB.setColorAt(instance, foliageColor.clone().multiplyScalar(0.88));
+  });
+
+  terrainGroup.add(pineTrunks, pineLower, pineMid, pineTop, broadTrunks, broadCrownsA, broadCrownsB);
 
   const bushCount = Math.min(bushCandidates.length, 1800);
   const bushes = new InstancedMesh(bushGeometry, bushMaterial, bushCount);
   bushes.castShadow = true;
   bushCandidates.slice(0, bushCount).forEach((index, instance) => {
-    const { x, z } = positionsFromIndex(index, verticesPerSide);
+    const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.40);
     const scale = 0.5 + hash01(index, instance, 23) * 1.35;
     scratchEuler.set(0.08, hash01(index, instance, 24) * Math.PI * 2, -0.05);
     scratchQuat.setFromEuler(scratchEuler);
@@ -860,7 +1109,7 @@ function addDetails(map: MapData, heights: Float32Array, biomeAt: Biome[], verti
   const grasses = new InstancedMesh(grassGeometry, grassMaterial, grassCount);
   grasses.castShadow = true;
   grassCandidates.slice(0, grassCount).forEach((index, instance) => {
-    const { x, z } = positionsFromIndex(index, verticesPerSide);
+    const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.42);
     const scale = 0.55 + hash01(index, instance, 13) * 0.9;
     scratchEuler.set(0, hash01(index, instance, 17) * Math.PI * 2, 0);
     scratchQuat.setFromEuler(scratchEuler);
@@ -872,12 +1121,13 @@ function addDetails(map: MapData, heights: Float32Array, biomeAt: Biome[], verti
     grasses.setMatrixAt(instance, scratchMatrix);
   });
   terrainGroup.add(grasses);
+  }
 
   const rockCount = Math.min(rockCandidates.length, 650);
   const rocks = new InstancedMesh(rockGeometry, rockMaterial, rockCount);
   rocks.castShadow = true;
   rockCandidates.slice(0, rockCount).forEach((index, instance) => {
-    const { x, z } = positionsFromIndex(index, verticesPerSide);
+    const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.36);
     const scale = 0.55 + hash01(index, instance, 9) * 1.15;
     scratchMatrix.makeScale(scale, 0.5 + scale * 0.45, scale);
     scratchMatrix.setPosition(x, heights[index] + scale * 2.1, z);
@@ -909,8 +1159,223 @@ function addDetails(map: MapData, heights: Float32Array, biomeAt: Biome[], verti
 
 }
 
+function addVegetationModelInstances(
+  treeCandidates: number[],
+  bushCandidates: number[],
+  grassCandidates: number[],
+  heights: Float32Array,
+  verticesPerSide: number,
+) {
+  const trees = treeCandidates.slice(0, 1500);
+  const bushes = bushCandidates.slice(0, 900);
+  const grasses = grassCandidates.slice(0, 700);
+
+  trees.forEach((index, instance) => {
+    const pine = hash01(index, instance, 81) < 0.68;
+    const models = pine ? vegetationAssets.pines : vegetationAssets.broadleaf;
+    const model = models[Math.floor(hash01(index, instance, 82) * models.length)];
+    const targetHeight = pine
+      ? 16 + hash01(index, instance, 83) * 16
+      : 10 + hash01(index, instance, 84) * 12;
+    placeVegetationModel(model, index, instance, heights, verticesPerSide, targetHeight, 0.06);
+  });
+
+  bushes.forEach((index, instance) => {
+    const model = vegetationAssets.bushes[Math.floor(hash01(index, instance, 91) * vegetationAssets.bushes.length)];
+    placeVegetationModel(model, index, instance, heights, verticesPerSide, 1.4 + hash01(index, instance, 92) * 2.0, 0.10);
+  });
+
+  grasses.forEach((index, instance) => {
+    const model = vegetationAssets.grasses[Math.floor(hash01(index, instance, 101) * vegetationAssets.grasses.length)];
+    placeVegetationModel(model, index, instance, heights, verticesPerSide, 0.55 + hash01(index, instance, 102) * 0.95, 0.16);
+  });
+}
+
+function placeVegetationModel(
+  source: Group | undefined,
+  index: number,
+  instance: number,
+  heights: Float32Array,
+  verticesPerSide: number,
+  targetHeight: number,
+  leanAmount: number,
+) {
+  if (!source) return;
+
+  const clone = source.clone(true);
+  const bounds = new Box3().setFromObject(source);
+  const sourceHeight = Math.max(0.001, bounds.max.y - bounds.min.y);
+  const scale = targetHeight / sourceHeight;
+  const { x, z } = jitteredPositionFromIndex(index, instance, verticesPerSide, 0.48);
+  const yawAmount = hash01(index, instance, 111) * Math.PI * 2;
+  const leanX = (hash01(index, instance, 112) - 0.5) * leanAmount;
+  const leanZ = (hash01(index, instance, 113) - 0.5) * leanAmount;
+
+  clone.position.set(x, heights[index], z);
+  clone.rotation.set(leanX, yawAmount, leanZ);
+  clone.scale.setScalar(scale);
+  clone.traverse((child) => {
+    if (child instanceof Mesh) {
+      child.castShadow = true;
+      child.receiveShadow = true;
+      if (child.material instanceof MeshStandardMaterial) {
+        child.material = child.material.clone();
+        child.material.roughness = Math.max(child.material.roughness, 0.82);
+        child.material.metalness = 0;
+        child.material.envMapIntensity = Math.min(child.material.envMapIntensity, 0.08);
+        child.material.color.multiplyScalar(0.72 + hash01(index, instance, 119) * 0.22);
+      }
+    }
+  });
+  terrainGroup.add(clone);
+}
+
 function buildWaterGeometry(biomeAt: Biome[], verticesPerSide: number, seaLevel: number) {
-  return buildMaskGeometry(biomeAt, undefined, verticesPerSide, "water", seaLevel + 0.35);
+  const resolution = verticesPerSide - 1;
+  const half = WORLD_SIZE / 2;
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  const subdivisions = 3;
+
+  for (let z = 0; z < resolution; z += 1) {
+    for (let x = 0; x < resolution; x += 1) {
+      const a = z * verticesPerSide + x;
+      const b = a + 1;
+      const c = a + verticesPerSide;
+      const d = c + 1;
+
+      if (![biomeAt[a], biomeAt[b], biomeAt[c], biomeAt[d]].some((biome) => biome === "water")) {
+        continue;
+      }
+
+      for (let sz = 0; sz < subdivisions; sz += 1) {
+        for (let sx = 0; sx < subdivisions; sx += 1) {
+          const u0 = (x + sx / subdivisions) / resolution;
+          const u1 = (x + (sx + 1) / subdivisions) / resolution;
+          const v0 = (z + sz / subdivisions) / resolution;
+          const v1 = (z + (sz + 1) / subdivisions) / resolution;
+          const x0 = u0 * WORLD_SIZE - half;
+          const x1 = u1 * WORLD_SIZE - half;
+          const z0 = v0 * WORLD_SIZE - half;
+          const z1 = v1 * WORLD_SIZE - half;
+          const base = positions.length / 3;
+          const y = seaLevel + 0.35;
+
+          positions.push(x0, y, z0, x1, y, z0, x0, y, z1, x1, y, z1);
+          uvs.push(x0 * 0.01, z0 * 0.01, x1 * 0.01, z0 * 0.01, x0 * 0.01, z1 * 0.01, x1 * 0.01, z1 * 0.01);
+          indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
+        }
+      }
+    }
+  }
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("uv", new BufferAttribute(new Float32Array(uvs), 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function buildBiomeTerrainGeometry(
+  biomeAt: Biome[],
+  heights: Float32Array,
+  colors: Float32Array,
+  normals: Float32Array,
+  verticesPerSide: number,
+  target: Biome,
+) {
+  const resolution = verticesPerSide - 1;
+  const half = WORLD_SIZE / 2;
+  const positions: number[] = [];
+  const vertexColors: number[] = [];
+  const vertexNormals: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+
+  for (let z = 0; z < resolution; z += 1) {
+    for (let x = 0; x < resolution; x += 1) {
+      const a = z * verticesPerSide + x;
+      const b = a + 1;
+      const c = a + verticesPerSide;
+      const d = c + 1;
+      const cellBiome = terrainBaseBiome(dominantCellBiome([biomeAt[a], biomeAt[b], biomeAt[c], biomeAt[d]]));
+
+      if (cellBiome !== target) continue;
+
+      const base = positions.length / 3;
+      const x0 = (x / resolution) * WORLD_SIZE - half;
+      const x1 = ((x + 1) / resolution) * WORLD_SIZE - half;
+      const z0 = (z / resolution) * WORLD_SIZE - half;
+      const z1 = ((z + 1) / resolution) * WORLD_SIZE - half;
+      positions.push(x0, heights[a], z0, x1, heights[b], z0, x0, heights[c], z1, x1, heights[d], z1);
+      pushTerrainColor(vertexColors, colors, biomeAt, a, target);
+      pushTerrainColor(vertexColors, colors, biomeAt, b, target);
+      pushTerrainColor(vertexColors, colors, biomeAt, c, target);
+      pushTerrainColor(vertexColors, colors, biomeAt, d, target);
+      pushColor(vertexNormals, normals, a);
+      pushColor(vertexNormals, normals, b);
+      pushColor(vertexNormals, normals, c);
+      pushColor(vertexNormals, normals, d);
+      uvs.push(x0 * 0.11, z0 * 0.11, x1 * 0.11, z0 * 0.11, x0 * 0.11, z1 * 0.11, x1 * 0.11, z1 * 0.11);
+      indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
+    }
+  }
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("color", new BufferAttribute(new Float32Array(vertexColors), 3));
+  geometry.setAttribute("normal", new BufferAttribute(new Float32Array(vertexNormals), 3));
+  geometry.setAttribute("uv", new BufferAttribute(new Float32Array(uvs), 2));
+  geometry.setIndex(indices);
+  return geometry;
+}
+
+function buildTerrainNormals(heights: Float32Array, verticesPerSide: number) {
+  const normals = new Float32Array(heights.length * 3);
+  const spacing = WORLD_SIZE / (verticesPerSide - 1);
+
+  for (let z = 0; z < verticesPerSide; z += 1) {
+    for (let x = 0; x < verticesPerSide; x += 1) {
+      const index = z * verticesPerSide + x;
+      const left = heights[z * verticesPerSide + Math.max(0, x - 1)];
+      const right = heights[z * verticesPerSide + Math.min(verticesPerSide - 1, x + 1)];
+      const down = heights[Math.max(0, z - 1) * verticesPerSide + x];
+      const up = heights[Math.min(verticesPerSide - 1, z + 1) * verticesPerSide + x];
+      const normal = new Vector3(left - right, spacing * 2.0, down - up).normalize();
+      normals[index * 3] = normal.x;
+      normals[index * 3 + 1] = normal.y;
+      normals[index * 3 + 2] = normal.z;
+    }
+  }
+
+  return normals;
+}
+
+function dominantCellBiome(cell: Biome[]) {
+  const counts = new Map<Biome, number>();
+  for (const biome of cell) {
+    counts.set(biome, (counts.get(biome) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function terrainBaseBiome(biome: Biome): Biome {
+  if (biome === "road" || biome === "building") return "grass";
+  return biome;
+}
+
+function pushColor(target: number[], colors: Float32Array, index: number) {
+  target.push(colors[index * 3], colors[index * 3 + 1], colors[index * 3 + 2]);
+}
+
+function pushTerrainColor(target: number[], colors: Float32Array, biomeAt: Biome[], index: number, targetBiome: Biome) {
+  if (targetBiome === "grass" && (biomeAt[index] === "road" || biomeAt[index] === "building")) {
+    target.push(0.18, 0.34, 0.12);
+    return;
+  }
+  pushColor(target, colors, index);
 }
 
 function buildShorelineGeometry(
@@ -992,7 +1457,7 @@ function buildMaskGeometry(
       const y2 = heights ? heights[c] + yOrOffset : yOrOffset;
       const y3 = heights ? heights[d] + yOrOffset : yOrOffset;
       positions.push(x0, y0, z0, x1, y1, z0, x0, y2, z1, x1, y3, z1);
-      uvs.push(x0 * 0.035, z0 * 0.035, x1 * 0.035, z0 * 0.035, x0 * 0.035, z1 * 0.035, x1 * 0.035, z1 * 0.035);
+      uvs.push(x0 * 0.11, z0 * 0.11, x1 * 0.11, z0 * 0.11, x0 * 0.11, z1 * 0.11, x1 * 0.11, z1 * 0.11);
       indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
     }
   }
@@ -1012,7 +1477,7 @@ function clearTerrain() {
       child.geometry.dispose();
     }
   }
-  terrainMesh = undefined;
+  terrainMeshes = [];
   waterMesh = undefined;
 }
 
@@ -1037,16 +1502,18 @@ function colorForSurface(
   u: number,
   v: number,
 ): number[] {
-  const variation = hash01(Math.floor(u * 900), Math.floor(v * 900), 11);
+  const broadVariation = valueNoise01(u, v, 18, 11);
+  const fineVariation = valueNoise01(u, v, 74, 12);
+  const variation = broadVariation * 0.72 + fineVariation * 0.28;
   const palette: Record<Biome, number[]> = {
-    water: [0.04, 0.2, 0.28],
-    sand: [0.62, 0.54, 0.36],
-    grass: mixColor([0.23, 0.38, 0.16], [0.48, 0.55, 0.27], variation),
-    forest: mixColor([0.06, 0.18, 0.07], [0.16, 0.29, 0.1], variation),
-    rock: mixColor([0.34, 0.33, 0.3], [0.62, 0.59, 0.52], variation),
-    road: [0.38, 0.36, 0.32],
-    building: [0.5, 0.23, 0.14],
-    snow: [0.82, 0.84, 0.8],
+    water: [0.01, 0.18, 0.34],
+    sand: mixColor([0.42, 0.36, 0.22], [0.62, 0.52, 0.32], variation),
+    grass: mixColor([0.08, 0.23, 0.07], [0.22, 0.42, 0.12], variation),
+    forest: mixColor([0.018, 0.095, 0.036], [0.055, 0.20, 0.058], variation),
+    rock: mixColor([0.26, 0.26, 0.24], [0.44, 0.42, 0.36], variation),
+    road: [0.34, 0.29, 0.22],
+    building: [0.58, 0.24, 0.14],
+    snow: [0.62, 0.64, 0.6],
   };
   let color = palette[biome];
 
@@ -1054,21 +1521,200 @@ function colorForSurface(
     color = mixColor(color, palette.rock, Math.min(0.62, (slope - 0.65) / 1.4));
   }
 
-  if (biome !== "water" && height > 68) {
-    color = mixColor(color, palette.snow, Math.min(0.34, (height - 68) / 34));
+  if (biome !== "water" && height > seaLevel + 190) {
+    color = mixColor(color, palette.snow, Math.min(0.08, (height - seaLevel - 190) / 120));
   }
 
-  if (biome !== "water" && height < seaLevel + 6) {
-    color = mixColor(color, palette.sand, 0.42);
+  if (biome !== "water" && height < seaLevel + 10) {
+    color = mixColor(color, palette.sand, 0.18);
   }
 
-  return color;
+  return shadeColor(color, 0.66 + variation * 0.22);
 }
 
-function sampleBlurredHeight(image: ImageData, u: number, v: number): number {
+function heightForHeightmap(heightmap: ImageData, seaLevel: number, u: number, v: number) {
+  const broad = sampleBlurredHeight(heightmap, u, v, 10);
+  const regional = sampleBlurredHeight(heightmap, u, v, 4);
+  const low = smoothstep(0.08, 0.82, broad);
+  const mountain = Math.pow(smoothstep(0.72, 0.995, broad), 2.1);
+  const plains = seaLevel + 8 + low * 64;
+  const hills = (regional - broad) * 8;
+  const mountains = mountain * 118;
+  const height = plains + hills + mountains;
+
+  return height;
+}
+
+function reshapeTerrainHeights(heights: Float32Array, verticesPerSide: number, seaLevel: number) {
+  const sorted = Array.from(heights).sort((a, b) => a - b);
+  const low = sorted[Math.floor(sorted.length * 0.02)];
+  const high = sorted[Math.floor(sorted.length * 0.995)];
+  const mountainStart = seaLevel + 112;
+
+  for (let i = 0; i < heights.length; i += 1) {
+    const normalized = Math.min(1, Math.max(0, (heights[i] - low) / Math.max(1, high - low)));
+    const playable = Math.pow(normalized, 1.9);
+    let remapped = seaLevel + 4 + playable * 205;
+    if (remapped > mountainStart) {
+      remapped = mountainStart + Math.pow((remapped - mountainStart) / 120, 0.62) * 82;
+    }
+    heights[i] = Math.max(seaLevel - 18, Math.min(seaLevel + 220, remapped));
+  }
+
+  relaxTerrainSlopes(heights, verticesPerSide, seaLevel, 4);
+}
+
+function relaxTerrainSlopes(heights: Float32Array, verticesPerSide: number, seaLevel: number, iterations: number) {
+  const spacing = WORLD_SIZE / (verticesPerSide - 1);
+
+  for (let pass = 0; pass < iterations; pass += 1) {
+    const source = new Float32Array(heights);
+    for (let z = 1; z < verticesPerSide - 1; z += 1) {
+      for (let x = 1; x < verticesPerSide - 1; x += 1) {
+        const index = z * verticesPerSide + x;
+        const height = source[index];
+        const mountain = smoothstep(seaLevel + 92, seaLevel + 220, height);
+        const maxDelta = spacing * (0.065 + mountain * 0.095);
+        let sum = height;
+        let count = 1;
+
+        for (let dz = -1; dz <= 1; dz += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dz === 0) continue;
+            const next = (z + dz) * verticesPerSide + x + dx;
+            const neighbor = source[next];
+            const delta = height - neighbor;
+            if (delta > maxDelta) {
+              sum += neighbor + maxDelta;
+              count += 1;
+            } else {
+              sum += neighbor * 0.16;
+              count += 0.16;
+            }
+          }
+        }
+
+        const thermal = sum / count;
+        const broad = (
+          source[index] * 0.44 +
+          (source[index - 1] + source[index + 1] + source[index - verticesPerSide] + source[index + verticesPerSide]) * 0.11 +
+          (source[index - verticesPerSide - 1] + source[index - verticesPerSide + 1] + source[index + verticesPerSide - 1] + source[index + verticesPerSide + 1]) * 0.03
+        );
+        const smoothing = 0.28 + mountain * 0.48;
+        heights[index] = Math.min(seaLevel + 220, Math.max(seaLevel - 18, height * (1 - smoothing) + ((thermal + broad) * 0.5) * smoothing));
+      }
+    }
+  }
+}
+
+function clampHeights(heights: Float32Array, minHeight: number, maxHeight: number) {
+  for (let i = 0; i < heights.length; i += 1) {
+    const height = heights[i];
+    heights[i] = Number.isFinite(height) ? Math.min(maxHeight, Math.max(minHeight, height)) : minHeight;
+  }
+}
+
+function logHeightStats(label: string, heights: Float32Array, seaLevel: number) {
+  if (!DEBUG_TERRAIN) return;
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+  let nonFinite = 0;
+  let aboveWater = 0;
+
+  for (const height of heights) {
+    if (!Number.isFinite(height)) {
+      nonFinite += 1;
+      continue;
+    }
+    min = Math.min(min, height);
+    max = Math.max(max, height);
+    sum += height;
+    if (height > seaLevel) aboveWater += 1;
+  }
+
+  console.log(`[terrain] heights ${label}`, {
+    min: Number(min.toFixed(2)),
+    max: Number(max.toFixed(2)),
+    avg: Number((sum / Math.max(1, heights.length - nonFinite)).toFixed(2)),
+    nonFinite,
+    aboveWater,
+  });
+}
+
+function analyzeTerrain(heights: Float32Array, verticesPerSide: number, seaLevel: number) {
+  const count = heights.length;
+  const slope = new Float32Array(count);
+  const flow = new Float32Array(count);
+  const moisture = new Float32Array(count);
+  const receiver = new Int32Array(count);
+  const order = Array.from({ length: count }, (_, index) => index);
+  const spacing = WORLD_SIZE / (verticesPerSide - 1);
+
+  for (let z = 0; z < verticesPerSide; z += 1) {
+    for (let x = 0; x < verticesPerSide; x += 1) {
+      const index = z * verticesPerSide + x;
+      const left = heights[z * verticesPerSide + Math.max(0, x - 1)];
+      const right = heights[z * verticesPerSide + Math.min(verticesPerSide - 1, x + 1)];
+      const down = heights[Math.max(0, z - 1) * verticesPerSide + x];
+      const up = heights[Math.min(verticesPerSide - 1, z + 1) * verticesPerSide + x];
+      slope[index] = Math.hypot(right - left, up - down) / (spacing * 2);
+      receiver[index] = lowestNeighbor(index, x, z, heights, verticesPerSide);
+      flow[index] = 1;
+    }
+  }
+
+  order.sort((a, b) => heights[b] - heights[a]);
+  for (const index of order) {
+    const target = receiver[index];
+    if (target !== index) flow[target] += flow[index];
+  }
+
+  let maxFlow = 1;
+  for (let i = 0; i < count; i += 1) maxFlow = Math.max(maxFlow, flow[i]);
+
+  for (let i = 0; i < count; i += 1) {
+    const normalizedFlow = Math.log(flow[i]) / Math.log(maxFlow);
+    flow[i] = normalizedFlow;
+    const lowlandWetness = 1 - smoothstep(seaLevel + 35, seaLevel + 210, heights[i]);
+    moisture[i] = Math.min(1, Math.max(0, normalizedFlow * 1.15 + lowlandWetness * 0.55 + (1 - Math.min(1, slope[i] * 2.4)) * 0.16));
+  }
+
+  return { flow, moisture, slope };
+}
+
+function lowestNeighbor(index: number, x: number, z: number, heights: Float32Array, verticesPerSide: number) {
+  let best = index;
+  let bestHeight = heights[index];
+
+  for (let dz = -1; dz <= 1; dz += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dz === 0) continue;
+      const nx = x + dx;
+      const nz = z + dz;
+      if (nx < 0 || nz < 0 || nx >= verticesPerSide || nz >= verticesPerSide) continue;
+      const next = nz * verticesPerSide + nx;
+      if (heights[next] < bestHeight) {
+        bestHeight = heights[next];
+        best = next;
+      }
+    }
+  }
+
+  return best;
+}
+
+function biomeForTerrain(height: number, slope: number, moisture: number, flow: number, seaLevel: number): Biome {
+  if (height <= seaLevel || (flow > 0.84 && height < seaLevel + 130 && slope < 0.16)) return "water";
+  if (slope > 0.46 || height > seaLevel + 170) return "rock";
+  if (height < seaLevel + 8 && flow > 0.22) return "sand";
+  if (moisture > 0.50 && height < seaLevel + 155 && slope < 0.28) return "forest";
+  return "grass";
+}
+
+function sampleBlurredHeight(image: ImageData, u: number, v: number, radius = 2): number {
   let total = 0;
   let weightTotal = 0;
-  const radius = 2;
 
   for (let y = -radius; y <= radius; y += 1) {
     for (let x = -radius; x <= radius; x += 1) {
@@ -1086,6 +1732,22 @@ function hash01(x: number, y: number, seed: number) {
   let n = x * 374761393 + y * 668265263 + seed * 1442695041;
   n = (n ^ (n >> 13)) * 1274126177;
   return ((n ^ (n >> 16)) >>> 0) / 4294967295;
+}
+
+function valueNoise01(u: number, v: number, frequency: number, seed: number) {
+  const x = u * frequency;
+  const y = v * frequency;
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = smoothstep(0, 1, x - ix);
+  const fy = smoothstep(0, 1, y - iy);
+  const a = hash01(ix, iy, seed);
+  const b = hash01(ix + 1, iy, seed);
+  const c = hash01(ix, iy + 1, seed);
+  const d = hash01(ix + 1, iy + 1, seed);
+  const ab = a + (b - a) * fx;
+  const cd = c + (d - c) * fx;
+  return ab + (cd - ab) * fy;
 }
 
 function samplePixel(image: ImageData, u: number, v: number): number[] {
@@ -1139,6 +1801,16 @@ function positionsFromIndex(index: number, verticesPerSide: number) {
   );
 }
 
+function jitteredPositionFromIndex(index: number, instance: number, verticesPerSide: number, amount: number) {
+  const position = positionsFromIndex(index, verticesPerSide);
+  const spacing = WORLD_SIZE / (verticesPerSide - 1);
+  position.x += (hash01(index, instance, 211) - 0.5) * spacing * amount * 2;
+  position.z += (hash01(index, instance, 212) - 0.5) * spacing * amount * 2;
+  position.x = Math.max(-WORLD_SIZE / 2, Math.min(WORLD_SIZE / 2, position.x));
+  position.z = Math.max(-WORLD_SIZE / 2, Math.min(WORLD_SIZE / 2, position.z));
+  return position;
+}
+
 function mixColor(a: number[], b: number[], amount: number) {
   const t = Math.min(1, Math.max(0, amount));
   return [
@@ -1146,6 +1818,15 @@ function mixColor(a: number[], b: number[], amount: number) {
     a[1] + (b[1] - a[1]) * t,
     a[2] + (b[2] - a[2]) * t,
   ];
+}
+
+function shadeColor(color: number[], amount: number) {
+  return color.map((component) => Math.min(1, Math.max(0, component * amount)));
+}
+
+function smoothstep(edge0: number, edge1: number, value: number) {
+  const t = Math.min(1, Math.max(0, (value - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
 }
 
 function addSkyDome() {
@@ -1206,34 +1887,40 @@ function addSkyDome() {
         float day = smoothstep(-0.12, 0.35, sunUp);
         vec3 nightTop = vec3(0.015, 0.025, 0.055);
         vec3 nightBottom = vec3(0.035, 0.045, 0.075);
-        vec3 dayTop = vec3(0.28, 0.53, 0.76);
-        vec3 dayBottom = vec3(0.72, 0.80, 0.82);
-        vec3 duskTop = vec3(0.35, 0.20, 0.34);
-        vec3 duskBottom = vec3(0.90, 0.46, 0.22);
+        vec3 dayTop = vec3(0.22, 0.50, 0.86);
+        vec3 dayBottom = vec3(0.72, 0.88, 1.0);
+        vec3 duskTop = vec3(0.24, 0.26, 0.46);
+        vec3 duskBottom = vec3(0.95, 0.58, 0.36);
         float dusk = smoothstep(0.0, 0.22, abs(sunUp)) * (1.0 - smoothstep(0.22, 0.55, abs(sunUp)));
         vec3 sky = mix(mix(nightBottom, nightTop, h), mix(dayBottom, dayTop, h), day);
-        sky = mix(sky, mix(duskBottom, duskTop, h), dusk * 0.8);
+        sky = mix(sky, mix(duskBottom, duskTop, h), dusk * 0.72);
 
-        vec2 cloudUv = dir.xz / max(dir.y + 0.35, 0.18) * 1.45 + vec2(time * 0.012, time * -0.006);
-        float cloudShape = fbm(cloudUv * 2.0);
+        vec2 cloudUv = dir.xz / max(dir.y + 0.32, 0.16) * 1.55 + vec2(time * 0.010, time * -0.005);
+        float cloudShape = fbm(cloudUv * 2.1);
+        float cloudWisps = fbm(cloudUv * 7.0 + vec2(time * -0.018, time * 0.011));
+        cloudShape = cloudShape * 0.72 + cloudWisps * 0.28;
         float coverage = mix(0.56, 0.28, step(0.5, weather));
         coverage = mix(coverage, 0.16, step(1.5, weather));
         coverage = mix(coverage, 0.08, step(2.5, weather));
         coverage = mix(coverage, 0.38, step(3.5, weather));
-        float clouds = smoothstep(coverage, coverage + 0.28, cloudShape) * smoothstep(0.05, 0.42, dir.y);
-        vec3 cloudColor = mix(vec3(0.95), vec3(0.23, 0.27, 0.29), smoothstep(1.1, 2.0, weather));
+        float clouds = smoothstep(coverage, coverage + 0.22, cloudShape) * smoothstep(0.02, 0.46, dir.y);
+        vec3 warmCloud = mix(vec3(1.0, 0.82, 0.68), vec3(0.94, 0.97, 1.0), day);
+        vec3 cloudColor = mix(warmCloud, vec3(0.23, 0.27, 0.29), smoothstep(1.1, 2.0, weather));
         cloudColor = mix(cloudColor, vec3(0.72, 0.76, 0.76), smoothstep(3.5, 4.0, weather));
-        cloudColor *= mix(0.28, 1.0, day);
+        cloudColor *= mix(0.38, 1.18, day);
         sky = mix(sky, cloudColor, clouds * mix(0.36, 0.82, clamp(weather / 2.0, 0.0, 1.0)));
 
         float sunDisk = smoothstep(0.9991, 1.0, dot(dir, sunDirection)) * day;
-        sky += vec3(1.0, 0.78, 0.42) * sunDisk * 2.2;
+        float sunGlow = pow(max(dot(dir, sunDirection), 0.0), 14.0) * day;
+        sky += vec3(1.0, 0.72, 0.38) * sunGlow * 0.42;
+        sky += vec3(1.0, 0.78, 0.42) * sunDisk * 2.6;
         gl_FragColor = vec4(sky, 1.0);
       }
     `,
   });
-  const sky = new Mesh(new SphereGeometry(2500, 48, 24), skyMaterial);
-  scene.add(sky);
+  skyDome = new Mesh(new SphereGeometry(2500, 64, 32), skyMaterial);
+  skyDome.renderOrder = -100;
+  scene.add(skyDome);
   addCloudDeck();
   addRain();
   updateEnvironment();
@@ -1366,6 +2053,41 @@ function loadLinearTexture(url: string) {
   return texture;
 }
 
+async function loadVegetationAssets() {
+  const base = "/assets/models/vendor/stylized_nature_megakitstandard/glTF";
+  const [pines, broadleaf, bushes, grasses] = await Promise.all([
+    Promise.all(["Pine_1.gltf", "Pine_2.gltf", "Pine_3.gltf", "Pine_4.gltf", "Pine_5.gltf"].map((name) => loadVegetationModel(`${base}/${name}`))),
+    Promise.all(["CommonTree_1.gltf", "CommonTree_2.gltf", "CommonTree_3.gltf", "TwistedTree_1.gltf", "TwistedTree_2.gltf"].map((name) => loadVegetationModel(`${base}/${name}`))),
+    Promise.all(["Bush_Common.gltf"].map((name) => loadVegetationModel(`${base}/${name}`))),
+    Promise.all(["Grass_Common_Short.gltf", "Grass_Common_Tall.gltf", "Grass_Wispy_Short.gltf"].map((name) => loadVegetationModel(`${base}/${name}`))),
+  ]);
+  vegetationAssets.pines = pines;
+  vegetationAssets.broadleaf = broadleaf;
+  vegetationAssets.bushes = bushes;
+  vegetationAssets.grasses = grasses;
+  vegetationAssets.loaded = true;
+}
+
+function loadVegetationModel(url: string) {
+  return new Promise<Group>((resolve, reject) => {
+    gltfLoader.load(
+      url,
+      (gltf) => {
+        const root = gltf.scene;
+        root.traverse((child) => {
+          if (child instanceof Mesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+          }
+        });
+        resolve(root);
+      },
+      undefined,
+      reject,
+    );
+  });
+}
+
 function loadImage(url: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
@@ -1376,14 +2098,18 @@ function loadImage(url: string) {
 }
 
 function animate() {
-  const delta = Math.min(clock.getDelta(), 0.05);
-  const elapsed = clock.elapsedTime;
+  timer.update();
+  const delta = Math.min(timer.getDelta(), 0.05);
+  const elapsed = timer.getElapsed();
   waterMaterial.uniforms.time.value = elapsed;
   if (skyMaterial) skyMaterial.uniforms.time.value = elapsed;
   if (cloudMaterial) cloudMaterial.uniforms.time.value = elapsed;
   if (cloudDeck) {
     cloudDeck.position.x = camera.position.x;
     cloudDeck.position.z = camera.position.z;
+  }
+  if (skyDome) {
+    skyDome.position.copy(camera.position);
   }
   if (skyControls.autoTime) {
     skyControls.timeOfDay = (skyControls.timeOfDay + delta * 0.006) % 1;
@@ -1466,13 +2192,13 @@ function updateEnvironment() {
   const storm = weatherModes[weatherValue] === "storm" ? 1 : 0;
   const foggy = weatherModes[weatherValue] === "fog" ? 1 : 0;
   const cloudy = weatherValue === 1 ? 1 : 0;
-  const fogColor = new Color(storm ? "#657277" : foggy ? "#a7b2af" : cloudy || rainWeather ? "#9eaeb0" : "#aebfc6");
+  const fogColor = new Color(storm ? "#657277" : foggy ? "#a7b2af" : cloudy || rainWeather ? "#9eaeb0" : "#b6c9cf");
 
   sun.position.copy(sunDir).multiplyScalar(900);
   sun.intensity = (3.8 * day) * (storm ? 0.25 : rainWeather ? 0.42 : cloudy ? 0.58 : foggy ? 0.5 : 1);
   renderer.toneMappingExposure = storm ? 0.82 : rainWeather || cloudy ? 0.9 : foggy ? 0.95 : 1.02;
-  const fogNear = storm ? 620 : foggy ? 260 : rainWeather ? 900 : cloudy ? 1200 : 1600;
-  const fogFar = storm ? 2200 : foggy ? 1200 : rainWeather ? 3000 : cloudy ? 3900 : 5200;
+  const fogNear = storm ? 620 : foggy ? 260 : rainWeather ? 900 : cloudy ? 1200 : 2200;
+  const fogFar = storm ? 2200 : foggy ? 1200 : rainWeather ? 3000 : cloudy ? 3900 : 6200;
   scene.fog = new Fog(fogColor, fogNear, fogFar);
   renderer.setClearColor(fogColor);
   terrainShaderMaterial.uniforms.sunDirection.value.copy(sunDir);
@@ -1480,7 +2206,7 @@ function updateEnvironment() {
   terrainShaderMaterial.uniforms.fogNear.value = scene.fog.near;
   terrainShaderMaterial.uniforms.fogFar.value = scene.fog.far;
   waterMaterial.uniforms.sunDirection.value.copy(sunDir);
-  waterMaterial.uniforms.skyColor.value.copy(fogColor).lerp(new Color("#6f9db7"), storm ? 0.12 : 0.34);
+  waterMaterial.uniforms.skyColor.value.copy(new Color("#0b2638")).lerp(fogColor, storm ? 0.12 : rainWeather || cloudy ? 0.06 : 0.015);
   waterMaterial.uniforms.stormFactor.value = storm ? 1 : rainWeather ? 0.45 : 0;
   if (skyMaterial) {
     skyMaterial.uniforms.timeOfDay.value = skyControls.timeOfDay;
